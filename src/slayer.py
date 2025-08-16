@@ -977,3 +977,197 @@ class _delayFunctionNoGradient(torch.autograd.Function):
         '''
         (delay, Ts) = ctx.saved_tensors
         return slayerCuda.shift(gradOutput.contiguous(), -delay, Ts), None, None
+
+
+class _batchNormLayer(nn.Module):
+    '''
+    Batch normalization layer for SNN that normalizes across batch and spatial dimensions
+    while preserving temporal dynamics. This is designed to work with NCHWT format tensors.
+    '''
+    def __init__(self, numFeatures, eps=1e-5, momentum=0.1, affine=True, track_running_stats=True):
+        '''
+        Arguments:
+            * ``numFeatures`` (``int``): number of features/channels to normalize
+            * ``eps`` (``float``): epsilon value for numerical stability. Default: 1e-5  
+            * ``momentum`` (``float``): momentum for running statistics. Default: 0.1
+            * ``affine`` (``bool``): whether to use learnable affine parameters. Default: True
+            * ``track_running_stats`` (``bool``): whether to track running statistics. Default: True
+        '''
+        super(_batchNormLayer, self).__init__()
+        
+        self.numFeatures = numFeatures
+        self.eps = eps
+        self.momentum = momentum
+        self.affine = affine
+        self.track_running_stats = track_running_stats
+        
+        if self.affine:
+            self.weight = nn.Parameter(torch.ones(numFeatures))
+            self.bias = nn.Parameter(torch.zeros(numFeatures))
+        else:
+            self.register_parameter('weight', None)
+            self.register_parameter('bias', None)
+            
+        if self.track_running_stats:
+            self.register_buffer('running_mean', torch.zeros(numFeatures))
+            self.register_buffer('running_var', torch.ones(numFeatures))
+            self.register_buffer('num_batches_tracked', torch.tensor(0, dtype=torch.long))
+        else:
+            self.register_parameter('running_mean', None)
+            self.register_parameter('running_var', None)
+            self.register_parameter('num_batches_tracked', None)
+
+    def forward(self, input):
+        '''
+        Forward pass for batch normalization
+        
+        Arguments:
+            * ``input``: input tensor in NCHWT format (Batch, Channels, Height, Width, Time)
+            
+        Returns:
+            * normalized tensor with same shape as input
+        '''
+        # Input shape: (N, C, H, W, T)
+        N, C, H, W, T = input.shape
+        
+        if C != self.numFeatures:
+            raise ValueError(f'Expected {self.numFeatures} channels, got {C}')
+        
+        # Reshape to (N*H*W*T, C) for batch norm calculation
+        input_reshaped = input.permute(0, 2, 3, 4, 1).contiguous().view(-1, C)
+        
+        if self.training and self.track_running_stats:
+            # Update num_batches_tracked
+            if self.num_batches_tracked is not None:
+                self.num_batches_tracked += 1
+                if self.momentum is None:  # use cumulative moving average
+                    exponential_average_factor = 1.0 / float(self.num_batches_tracked)
+                else:  # use exponential moving average
+                    exponential_average_factor = self.momentum
+        else:
+            exponential_average_factor = 0.0
+            
+        if self.training or not self.track_running_stats:
+            # Calculate mean and variance across batch, spatial and temporal dimensions
+            # This preserves channel-wise statistics while normalizing across N, H, W, T
+            mean = input_reshaped.mean(dim=0)
+            var = input_reshaped.var(dim=0, unbiased=False)
+            
+            # Update running statistics
+            if self.track_running_stats:
+                with torch.no_grad():
+                    self.running_mean = exponential_average_factor * mean + \
+                                      (1 - exponential_average_factor) * self.running_mean
+                    self.running_var = exponential_average_factor * var + \
+                                     (1 - exponential_average_factor) * self.running_var
+        else:
+            mean = self.running_mean
+            var = self.running_var
+            
+        # Apply normalization
+        input_normalized = (input_reshaped - mean) / torch.sqrt(var + self.eps)
+        
+        # Apply affine transformation if enabled
+        if self.affine:
+            input_normalized = input_normalized * self.weight + self.bias
+            
+        # Reshape back to original format (N, C, H, W, T)
+        output = input_normalized.view(N, H, W, T, C).permute(0, 4, 1, 2, 3).contiguous()
+        
+        return output
+
+    def extra_repr(self):
+        return '{numFeatures}, eps={eps}, momentum={momentum}, affine={affine}, ' \
+               'track_running_stats={track_running_stats}'.format(**self.__dict__)
+
+
+# Add this method to the spikeLayer class
+def batchNorm(self, numFeatures, eps=1e-5, momentum=0.1, affine=True, track_running_stats=True):
+    '''
+    Returns a function that can be called to apply batch normalization to input tensor.
+    The batch normalization is applied across batch, spatial, and temporal dimensions
+    while preserving channel-wise statistics.
+
+    Arguments:
+        * ``numFeatures`` (``int``): number of features/channels to normalize (should match input channels)
+        * ``eps`` (``float``): epsilon value for numerical stability. Default: 1e-5
+        * ``momentum`` (``float``): momentum for running statistics during training. Default: 0.1  
+        * ``affine`` (``bool``): whether to use learnable scale and shift parameters. Default: True
+        * ``track_running_stats`` (``bool``): whether to track running mean and variance. Default: True
+
+    Usage:
+
+    >>> bn = snnLayer.batchNorm(32)  # for 32 channels
+    >>> normalized = bn(input)       # input should be (N, 32, H, W, T)
+    '''
+    return _batchNormLayer(numFeatures, eps, momentum, affine, track_running_stats)
+
+
+# Alternative temporal-preserving batch norm that normalizes each time step separately
+class _temporalBatchNormLayer(nn.Module):
+    '''
+    Temporal batch normalization layer that applies batch norm independently at each time step.
+    This preserves temporal dynamics better but requires more memory.
+    '''
+    def __init__(self, numFeatures, eps=1e-5, momentum=0.1, affine=True, track_running_stats=True):
+        super(_temporalBatchNormLayer, self).__init__()
+        
+        self.numFeatures = numFeatures
+        self.eps = eps
+        self.momentum = momentum
+        self.affine = affine
+        self.track_running_stats = track_running_stats
+        
+        # Create a 2D batch norm layer to handle spatial dimensions
+        self.bn2d = nn.BatchNorm2d(numFeatures, eps=eps, momentum=momentum, 
+                                   affine=affine, track_running_stats=track_running_stats)
+
+    def forward(self, input):
+        '''
+        Apply batch normalization independently at each time step
+        
+        Arguments:
+            * ``input``: input tensor in NCHWT format (Batch, Channels, Height, Width, Time)
+            
+        Returns:
+            * normalized tensor with same shape as input
+        '''
+        # Input shape: (N, C, H, W, T)
+        N, C, H, W, T = input.shape
+        
+        if C != self.numFeatures:
+            raise ValueError(f'Expected {self.numFeatures} channels, got {C}')
+        
+        # Process each time step independently
+        output_list = []
+        for t in range(T):
+            # Extract time step: (N, C, H, W)
+            input_t = input[:, :, :, :, t]
+            # Apply 2D batch norm: (N, C, H, W)
+            output_t = self.bn2d(input_t)
+            output_list.append(output_t.unsqueeze(-1))
+        
+        # Concatenate along time dimension: (N, C, H, W, T)
+        output = torch.cat(output_list, dim=-1)
+        
+        return output
+
+
+def temporalBatchNorm(self, numFeatures, eps=1e-5, momentum=0.1, affine=True, track_running_stats=True):
+    '''
+    Returns a function that applies batch normalization independently at each time step.
+    This approach preserves temporal dynamics better by not mixing statistics across time.
+
+    Arguments:
+        * ``numFeatures`` (``int``): number of features/channels to normalize
+        * ``eps`` (``float``): epsilon value for numerical stability. Default: 1e-5
+        * ``momentum`` (``float``): momentum for running statistics. Default: 0.1
+        * ``affine`` (``bool``): whether to use learnable parameters. Default: True
+        * ``track_running_stats`` (``bool``): whether to track running statistics. Default: True
+
+    Usage:
+
+    >>> tbn = snnLayer.temporalBatchNorm(32)  # for 32 channels  
+    >>> normalized = tbn(input)               # input should be (N, 32, H, W, T)
+    '''
+    return _temporalBatchNormLayer(numFeatures, eps, momentum, affine, track_running_stats)
