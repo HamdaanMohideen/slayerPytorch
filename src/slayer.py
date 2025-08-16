@@ -372,6 +372,46 @@ class spikeLayer(torch.nn.Module):
         '''
         return _delayLayer(inputSize, self.simulation['Ts'])
     
+    # Add this method to the spikeLayer class
+    def batchNorm(self, numFeatures, eps=1e-5, momentum=0.1, affine=True, track_running_stats=True):
+        '''
+        Returns a function that can be called to apply batch normalization to input tensor.
+        The batch normalization is applied across batch, spatial, and temporal dimensions
+        while preserving channel-wise statistics.
+
+        Arguments:
+            * ``numFeatures`` (``int``): number of features/channels to normalize (should match input channels)
+            * ``eps`` (``float``): epsilon value for numerical stability. Default: 1e-5
+            * ``momentum`` (``float``): momentum for running statistics during training. Default: 0.1  
+            * ``affine`` (``bool``): whether to use learnable scale and shift parameters. Default: True
+            * ``track_running_stats`` (``bool``): whether to track running mean and variance. Default: True
+
+        Usage:
+
+        >>> bn = snnLayer.batchNorm(32)  # for 32 channels
+        >>> normalized = bn(input)       # input should be (N, 32, H, W, T)
+        '''
+        return _batchNormLayer(numFeatures, eps, momentum, affine, track_running_stats)
+    
+    def temporalBatchNorm(self, numFeatures, eps=1e-5, momentum=0.1, affine=True, track_running_stats=True):
+        '''
+        Returns a function that applies batch normalization independently at each time step.
+        This approach preserves temporal dynamics better by not mixing statistics across time.
+
+        Arguments:
+            * ``numFeatures`` (``int``): number of features/channels to normalize
+            * ``eps`` (``float``): epsilon value for numerical stability. Default: 1e-5
+            * ``momentum`` (``float``): momentum for running statistics. Default: 0.1
+            * ``affine`` (``bool``): whether to use learnable parameters. Default: True
+            * ``track_running_stats`` (``bool``): whether to track running statistics. Default: True
+
+        Usage:
+
+        >>> tbn = snnLayer.temporalBatchNorm(32)  # for 32 channels  
+        >>> normalized = tbn(input)               # input should be (N, 32, H, W, T)
+        '''
+        return _temporalBatchNormLayer(numFeatures, eps, momentum, affine, track_running_stats)
+        
     # def applySpikeFunction(self, membranePotential):
     #   return _spikeFunction.apply(membranePotential, self.refKernel, self.neuron, self.simulation['Ts'])
 
@@ -1081,26 +1121,7 @@ class _batchNormLayer(nn.Module):
                'track_running_stats={track_running_stats}'.format(**self.__dict__)
 
 
-# Add this method to the spikeLayer class
-def batchNorm(self, numFeatures, eps=1e-5, momentum=0.1, affine=True, track_running_stats=True):
-    '''
-    Returns a function that can be called to apply batch normalization to input tensor.
-    The batch normalization is applied across batch, spatial, and temporal dimensions
-    while preserving channel-wise statistics.
 
-    Arguments:
-        * ``numFeatures`` (``int``): number of features/channels to normalize (should match input channels)
-        * ``eps`` (``float``): epsilon value for numerical stability. Default: 1e-5
-        * ``momentum`` (``float``): momentum for running statistics during training. Default: 0.1  
-        * ``affine`` (``bool``): whether to use learnable scale and shift parameters. Default: True
-        * ``track_running_stats`` (``bool``): whether to track running mean and variance. Default: True
-
-    Usage:
-
-    >>> bn = snnLayer.batchNorm(32)  # for 32 channels
-    >>> normalized = bn(input)       # input should be (N, 32, H, W, T)
-    '''
-    return _batchNormLayer(numFeatures, eps, momentum, affine, track_running_stats)
 
 
 # Alternative temporal-preserving batch norm that normalizes each time step separately
@@ -1153,21 +1174,3 @@ class _temporalBatchNormLayer(nn.Module):
         return output
 
 
-def temporalBatchNorm(self, numFeatures, eps=1e-5, momentum=0.1, affine=True, track_running_stats=True):
-    '''
-    Returns a function that applies batch normalization independently at each time step.
-    This approach preserves temporal dynamics better by not mixing statistics across time.
-
-    Arguments:
-        * ``numFeatures`` (``int``): number of features/channels to normalize
-        * ``eps`` (``float``): epsilon value for numerical stability. Default: 1e-5
-        * ``momentum`` (``float``): momentum for running statistics. Default: 0.1
-        * ``affine`` (``bool``): whether to use learnable parameters. Default: True
-        * ``track_running_stats`` (``bool``): whether to track running statistics. Default: True
-
-    Usage:
-
-    >>> tbn = snnLayer.temporalBatchNorm(32)  # for 32 channels  
-    >>> normalized = tbn(input)               # input should be (N, 32, H, W, T)
-    '''
-    return _temporalBatchNormLayer(numFeatures, eps, momentum, affine, track_running_stats)
